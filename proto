@@ -1,0 +1,1489 @@
+# musica_pro_omnibus/__init__.py
+# Ana modül: Tüm alt modülleri birleştiriyor
+
+# Standart kütüphaneler
+import sys
+import os
+import json
+import numpy as np
+import soundfile as sf
+import sounddevice as sd
+import logging
+import threading
+import time
+import ffmpeg
+import pyqtgraph as pg
+from scipy.signal import butter, lfilter
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from cachetools import TTLCache
+import torch
+from pedalboard import Reverb, Compressor, Delay, Chorus, HighpassFilter, LowpassFilter
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
+    QSlider, QLabel, QComboBox, QCheckBox, QFileDialog, QGraphicsView, QGraphicsScene,
+    QGraphicsRectItem, QStatusBar, QTextEdit, QLineEdit, QFontComboBox, QColorDialog, QProgressBar,
+    QGraphicsTextItem
+)
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QPropertyAnimation, QEasingCurve, QPointF
+from PyQt6.QtGui import QPen, QBrush, QPixmap, QImage, QColor, QFont
+import rtmidi
+from rtmidi.midiconstants import NOTE_ON, NOTE_OFF
+import socket
+import zmq
+import psutil
+import requests
+import websocket
+try:
+    from speechbrain.pretrained import Separator  # Ses segmentasyonu için
+except ImportError:
+    Separator = None
+try:
+    import whisper  # Ses transkripsiyonu için
+except ImportError:
+    whisper = None
+from flask import Flask, request, jsonify  # Sunucu için
+
+# Loglama yapılandırması
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', filename='musica_studio.log')
+
+# Hata sınıfları
+class MusicaError(Exception):
+    pass
+
+class MidiError(MusicaError):
+    pass
+
+class PluginError(MusicaError):
+    pass
+
+# musica_pro_omnibus/utils/config.py
+class ConfigManager:
+    def __init__(self):
+        self.config = {
+            "sample_rate": 48000,
+            "buffer_size": 128,
+            "theme": "dark",
+            "bpm": 140,
+            "food_mode": "none",  # Türk yemek modları için
+            "custom_colors": {"background": "#1E1E1E", "text": "#FFFFFF"},
+            "shortcuts": {"play": "P", "stop": "S", "export": "Ctrl+S"}
+        }
+        if os.path.exists("config.json"):
+            try:
+                with open("config.json", "r") as f:
+                    self.config.update(json.load(f))
+            except Exception as e:
+                logging.error(f"Config dosyası okunamadı: {str(e)}")
+
+    def get(self, key, default=None):
+        return self.config.get(key, default)
+
+    def set(self, key, value):
+        self.config[key] = value
+        self.save()
+
+    def save(self):
+        try:
+            with open("config.json", "w") as f:
+                json.dump(self.config, f)
+        except Exception as e:
+            logging.error(f"Config dosyası kaydedilemedi: {str(e)}")
+
+# musica_pro_omnibus/utils/distributed.py
+class DistributedProcessor:
+    def __init__(self, servers=["localhost:5555"]):
+        self.context = zmq.Context()
+        self.sockets = []
+        for server in servers:
+            socket = self.context.socket(zmq.REQ)
+            try:
+                socket.connect(f"tcp://{server}")
+                self.sockets.append(socket)
+            except Exception as e:
+                logging.error(f"ZMQ bağlantı hatası: {str(e)}")
+        self.current_socket = 0
+
+    def distribute_task(self, task_type, data, sample_rate):
+        if not self.sockets:
+            return data
+        socket = self.sockets[self.current_socket]
+        self.current_socket = (self.current_socket + 1) % len(self.sockets)
+        try:
+            message = json.dumps({
+                "task_type": task_type,
+                "data": data.tolist(),
+                "sample_rate": sample_rate
+            })
+            socket.send_string(message)
+            response = socket.recv_string()
+            result = np.array(json.loads(response)["result"], dtype=np.float32)
+            logging.info(f"Dağıtık görev tamamlandı: {task_type}")
+            return result
+        except Exception as e:
+            logging.error(f"Dağıtık görev hatası: {str(e)}")
+            return data
+
+# musica_pro_omnibus/utils/project.py
+class ProjectManager:
+    def __init__(self, audio_chain, server_host="localhost", server_port=12345, ws_url="ws://localhost:8765"):
+        self.audio_chain = audio_chain
+        self.project_data = {}
+        self.server_host = server_host
+        self.server_port = server_port
+        self.client_socket = None
+        self.ws_url = ws_url
+        self.ws = None
+        self.history = deque(maxlen=50)  # Global undo/redo için
+        self.init_socket()
+        self.init_websocket()
+
+    def init_socket(self):
+        try:
+            self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.client_socket.connect((self.server_host, self.server_port))
+            logging.info("Sunucuya bağlanıldı")
+        except Exception as e:
+            logging.error(f"Sunucu bağlantı hatası: {str(e)}")
+            self.client_socket = None
+
+    def init_websocket(self):
+        try:
+            self.ws = websocket.WebSocketApp(
+                self.ws_url,
+                on_message=self.on_ws_message,
+                on_error=self.on_ws_error,
+                on_close=self.on_ws_close
+            )
+            threading.Thread(target=self.ws.run_forever, daemon=True).start()
+            logging.info("WebSocket başlatıldı")
+        except Exception as e:
+            logging.error(f"WebSocket bağlantı hatası: {str(e)}")
+
+    def on_ws_message(self, ws, message):
+        try:
+            data = json.loads(message)
+            if data["action"] == "update_project":
+                self.project_data = data["project_data"]
+                self.audio_chain.production_tracks.clear()
+                for track_data in self.project_data["tracks"]:
+                    track = ProductionTrack(
+                        sample_rate=self.audio_chain.fs, channels=2, name=track_data["name"]
+                    )
+                    for clip in track_data["clips"]:
+                        audio = np.array(clip["audio"], dtype=np.float32)
+                        track.add_clip(audio, clip["start"])
+                    self.audio_chain.production_tracks.append(track)
+                logging.info("Proje güncellendi (WebSocket)")
+        except Exception as e:
+            logging.error(f"WebSocket mesaj işleme hatası: {str(e)}")
+
+    def on_ws_error(self, ws, error):
+        logging.error(f"WebSocket hatası: {str(error)}")
+
+    def on_ws_close(self, ws, close_status_code, close_msg):
+        logging.info("WebSocket kapatıldı")
+
+    def notify_server(self, action, data):
+        if not self.client_socket:
+            return
+        try:
+            message = json.dumps({"action": action, "data": data})
+            self.client_socket.send(message.encode())
+            response = self.client_socket.recv(1024).decode()
+            logging.info(f"Sunucu yanıtı: {response}")
+        except Exception as e:
+            logging.error(f"Sunucu iletişim hatası: {str(e)}")
+
+    def notify_ws(self, action, data):
+        if not self.ws:
+            return
+        try:
+            message = json.dumps({"action": action, "data": data})
+            self.ws.send(message)
+            logging.info(f"WebSocket mesajı gönderildi: {action}")
+        except Exception as e:
+            logging.error(f"WebSocket iletişim hatası: {str(e)}")
+
+    def export_project(self, file_path):
+        try:
+            project_data = {
+                "tracks": [],
+                "config": self.audio_chain.config.config,
+                "markers": [],
+            }
+            for track in self.audio_chain.production_tracks:
+                track_data = {
+                    "name": track.name,
+                    "clips": [{"audio": clip["audio"].tolist(), "start": clip["start"]} for clip in track.clips],
+                    "volume": track.volume,
+                    "pan": track.pan,
+                    "automation": track.automation.points,
+                    "effects": [effect.__class__.__name__ for effect in track.effects.effects]
+                }
+                project_data["tracks"].append(track_data)
+            with open(file_path, "w") as f:
+                json.dump(project_data, f)
+            self.notify_server("export_project", {"file_path": file_path})
+            self.notify_ws("update_project", {"project_data": project_data})
+            self.history.append(("export_project", project_data.copy()))
+            logging.info(f"Proje export edildi: {file_path}")
+            return True
+        except Exception as e:
+            logging.error(f"Proje export hatası: {str(e)}")
+            raise MusicaError(f"Proje export edilemedi: {str(e)}")
+
+    def import_project(self, file_path):
+        try:
+            with open(file_path, "r") as f:
+                project_data = json.load(f)
+            previous_state = {
+                "tracks": [track.__dict__.copy() for track in self.audio_chain.production_tracks],
+                "config": self.audio_chain.config.config.copy()
+            }
+            self.audio_chain.config.config.update(project_data["config"])
+            self.audio_chain.production_tracks.clear()
+            for track_data in project_data["tracks"]:
+                track = ProductionTrack(
+                    sample_rate=self.audio_chain.fs, channels=2, name=track_data["name"]
+                )
+                for clip in track_data["clips"]:
+                    audio = np.array(clip["audio"], dtype=np.float32)
+                    track.add_clip(audio, clip["start"])
+                track.volume = track_data["volume"]
+                track.pan = track_data["pan"]
+                track.automation.points = track_data["automation"]
+                for effect_name in track_data["effects"]:
+                    track.effects.add_effect(effect_name.lower())
+                self.audio_chain.production_tracks.append(track)
+            self.notify_server("import_project", {"file_path": file_path})
+            self.notify_ws("update_project", {"project_data": project_data})
+            self.history.append(("import_project", previous_state))
+            logging.info(f"Proje import edildi: {file_path}")
+            return project_data.get("markers", [])
+        except Exception as e:
+            logging.error(f"Proje import hatası: {str(e)}")
+            raise MusicaError(f"Proje import edilemedi: {str(e)}")
+
+    def undo(self):
+        if not self.history:
+            return False
+        action, data = self.history.pop()
+        if action == "export_project":
+            # Export işlemini geri almak için bir şey yapmaya gerek yok
+            pass
+        elif action == "import_project":
+            self.audio_chain.production_tracks.clear()
+            for track_dict in data["tracks"]:
+                track = ProductionTrack(
+                    sample_rate=self.audio_chain.fs, channels=2, name=track_dict["name"]
+                )
+                for clip in track_dict["clips"]:
+                    audio = np.array(clip["audio"], dtype=np.float32)
+                    track.add_clip(audio, clip["start"])
+                self.audio_chain.production_tracks.append(track)
+            self.audio_chain.config.config = data["config"]
+        return True
+
+# musica_pro_omnibus/utils/marketplace.py
+class AssetMarketplace:
+    def __init__(self, marketplace_url="http://localhost:8000/api"):
+        self.marketplace_url = marketplace_url
+
+    def list_assets(self, asset_type="effects"):
+        try:
+            # Mock marketplace verisi
+            assets = [
+                {"id": "reverb_plus", "name": "Reverb Plus", "type": "effect"},
+                {"id": "delay_pro", "name": "Delay Pro", "type": "effect"}
+            ]
+            logging.info(f"Varlıklar listelendi: {asset_type}")
+            return assets
+        except Exception as e:
+            logging.error(f"Varlık listeleme hatası: {str(e)}")
+            return []
+
+    def download_asset(self, asset_id, save_path):
+        try:
+            # Mock indirme işlemi
+            with open(save_path, "w") as f:
+                f.write(f"# Mock plugin: {asset_id}\ndef process(audio, sample_rate):\n    return audio")
+            logging.info(f"Varlık indirildi: {asset_id} -> {save_path}")
+            return True
+        except Exception as e:
+            logging.error(f"Varlık indirme hatası: {str(e)}")
+            return False
+
+# musica_pro_omnibus/audio/effects.py
+class PluginManager:
+    def __init__(self):
+        self.plugins = {"effects": {}, "synths": {}}
+        self.vst_support = False
+        self.distributed_processor = DistributedProcessor()
+
+    def load_plugin(self, plugin_path, plugin_type="effect"):
+        try:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("plugin", plugin_path)
+            plugin_module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(plugin_module)
+            if not hasattr(plugin_module, "process"):
+                raise PluginError("Eklenti 'process' fonksiyonu içermiyor!")
+            self.plugins[plugin_type][os.path.basename(plugin_path)] = plugin_module
+            logging.info(f"Eklenti yüklendi: {plugin_path} (Tür: {plugin_type})")
+        except Exception as e:
+            logging.error(f"Eklenti yükleme hatası: {str(e)}")
+            raise PluginError(f"Eklenti yüklenemedi: {str(e)}")
+
+    def load_vst(self, vst_path):
+        self.vst_support = True
+        logging.info(f"VST yüklendi (mock): {vst_path}")
+
+    def apply_plugin(self, plugin_name, audio, sample_rate, plugin_type="effect"):
+        if plugin_name not in self.plugins[plugin_type]:
+            raise PluginError(f"Eklenti bulunamadı: {plugin_name}")
+        return self.plugins[plugin_type][plugin_name].process(audio, sample_rate)
+
+    def process_on_server(self, audio, effect_type, sample_rate):
+        return self.distributed_processor.distribute_task("process_effect", audio, sample_rate)
+
+class EffectRack:
+    def __init__(self):
+        self.effects = []
+        self.dry_wet = 0.5
+        self.plugin_manager = PluginManager()
+
+    def add_effect(self, effect_type):
+        try:
+            if effect_type == "reverb":
+                self.effects.append(Reverb())
+            elif effect_type == "compressor":
+                self.effects.append(Compressor())
+            elif effect_type == "delay":
+                self.effects.append(Delay())
+            elif effect_type == "chorus":
+                self.effects.append(Chorus())
+            elif effect_type == "highpass":
+                self.effects.append(HighpassFilter())
+            elif effect_type == "lowpass":
+                self.effects.append(LowpassFilter())
+            elif effect_type.startswith("vst_"):
+                self.plugin_manager.load_vst(effect_type)
+            else:
+                self.plugin_manager.apply_plugin(effect_type, None, 0)
+            logging.info(f"Efekt eklendi: {effect_type}")
+        except Exception as e:
+            logging.error(f"Efekt ekleme hatası: {str(e)}")
+            raise PluginError(f"Efekt eklenemedi: {str(e)}")
+
+    def set_dry_wet(self, value):
+        self.dry_wet = max(0.0, min(1.0, value))
+
+    def process(self, audio, sample_rate=48000):
+        try:
+            processed = audio.copy()
+            for effect in self.effects:
+                if self.plugin_manager.vst_support:
+                    processed = self.plugin_manager.process_on_server(processed, effect.__class__.__name__, sample_rate)
+                else:
+                    processed = effect.process(processed, sample_rate=sample_rate)
+            return (1 - self.dry_wet) * audio + self.dry_wet * processed
+        except Exception as e:
+            logging.error(f"Efekt işleme hatası: {str(e)}")
+            return audio
+
+# musica_pro_omnibus/audio/dac.py
+class DACAmpSimulator:
+    def __init__(self, sample_rate=48000):
+        self.sample_rate = sample_rate
+        self.tone = 0.0  # -1.0 (düşük frekans vurgulu) ile 1.0 (yüksek frekans vurgulu) arası
+        self.drive = 0.0  # 0.0 (temiz) ile 1.0 (maksimum distortion) arası
+        self.output_level = 1.0
+        self.low_shelf_coeffs = [1.0, 0.0, 0.0, 0.0, 0.0]  # b0, b1, b2, a1, a2
+        self.high_shelf_coeffs = [1.0, 0.0, 0.0, 0.0, 0.0]
+        self.update_filters()
+
+    def set_tone(self, value):
+        self.tone = np.clip(value, -1.0, 1.0)
+        self.update_filters()
+
+    def set_drive(self, value):
+        self.drive = np.clip(value, 0.0, 1.0)
+
+    def set_output_level(self, value):
+        self.output_level = np.clip(value, 0.0, 2.0)
+
+    def update_filters(self):
+        # Low-shelf filtre (düşük frekanslar için)
+        gain_db = -10.0 * (1.0 - self.tone) if self.tone > 0 else 10.0 * abs(self.tone)
+        freq = 200.0  # Low-shelf frekansı
+        Q = 0.7
+        b, a = butter(2, freq / (self.sample_rate / 2), btype='lowshelf', output='ba', gain=gain_db, Q=Q)
+        self.low_shelf_coeffs = [b[0], b[1], b[2], a[1], a[2]]
+
+        # High-shelf filtre (yüksek frekanslar için)
+        gain_db = 10.0 * self.tone if self.tone > 0 else -10.0 * abs(self.tone)
+        freq = 4000.0  # High-shelf frekansı
+        b, a = butter(2, freq / (self.sample_rate / 2), btype='highshelf', output='ba', gain=gain_db, Q=Q)
+        self.high_shelf_coeffs = [b[0], b[1], b[2], a[1], a[2]]
+
+    def apply_distortion(self, audio):
+        # Soft clipping distortion
+        k = 2 * self.drive / (1 - self.drive + 1e-6)
+        audio = audio * (1 + k) / (1 + k * np.abs(audio))
+        return np.clip(audio, -1.0, 1.0)
+
+    def process(self, audio):
+        try:
+            # Low-shelf filtresi uygula
+            audio = lfilter(self.low_shelf_coeffs[:3], [1.0] + self.low_shelf_coeffs[3:], audio)
+
+            # High-shelf filtresi uygula
+            audio = lfilter(self.high_shelf_coeffs[:3], [1.0] + self.high_shelf_coeffs[3:], audio)
+
+            # Distortion uygula
+            if self.drive > 0.0:
+                audio = self.apply_distortion(audio)
+
+            # Çıkış seviyesini ayarla
+            audio *= self.output_level
+            return np.clip(audio, -1.0, 1.0)
+        except Exception as e:
+            logging.error(f"DAC işleme hatası: {str(e)}")
+            return audio
+
+# musica_pro_omnibus/audio/synth.py
+class WavetableOscillator:
+    def __init__(self, sample_rate=48000, wavetable_size=2048):
+        self.sample_rate = sample_rate
+        self.wavetable_size = wavetable_size
+        self.wavetable = self.generate_wavetable()
+        self.notes = {}
+        self.params = {"volume": 1.0, "detune": 0.0}
+        self.adsr = {"attack": 0.01, "decay": 0.1, "sustain": 0.7, "release": 0.2}
+        self.lfo = {"rate": 1.0, "depth": 0.0}
+        self.lfo_phase = 0.0
+
+    def generate_wavetable(self):
+        t = np.linspace(0, 1, self.wavetable_size, endpoint=False)
+        wavetable = np.sin(2 * np.pi * t)
+        for i in range(1, 10):
+            wavetable += (1/i) * np.sin(2 * np.pi * i * t)
+        return wavetable / np.max(np.abs(wavetable))
+
+    def note_on(self, note, velocity):
+        freq = 440 * (2 ** ((note - 69) / 12)) * (1 + self.params["detune"])
+        phase = 0.0
+        amplitude = velocity / 127 * self.params["volume"]
+        self.notes[note] = {
+            "freq": freq,
+            "phase": phase,
+            "amplitude": amplitude,
+            "state": "attack",
+            "time": 0.0,
+            "velocity": velocity
+        }
+
+    def note_off(self, note):
+        if note in self.notes:
+            self.notes[note]["state"] = "release"
+            self.notes[note]["time"] = 0.0
+
+    def set_param(self, param, value):
+        try:
+            if param in self.params:
+                self.params[param] = value
+            elif param in self.adsr:
+                self.adsr[param] = value
+            elif param in self.lfo:
+                self.lfo[param] = value
+        except Exception as e:
+            logging.error(f"Synth parametre ayarlama hatası: {str(e)}")
+
+    def apply_adsr(self, note_data, samples):
+        envelope = np.ones(samples)
+        t = np.linspace(0, samples / self.sample_rate, samples) + note_data["time"]
+        state = note_data["state"]
+        if state == "attack":
+            envelope = np.minimum(t / self.adsr["attack"], 1.0)
+            if t[-1] >= self.adsr["attack"]:
+                note_data["state"] = "decay"
+                note_data["time"] = 0.0
+        elif state == "decay":
+            start_level = 1.0
+            envelope = start_level - (start_level - self.adsr["sustain"]) * np.minimum(t / self.adsr["decay"], 1.0)
+            if t[-1] >= self.adsr["decay"]:
+                note_data["state"] = "sustain"
+                note_data["time"] = 0.0
+        elif state == "sustain":
+            envelope = np.full(samples, self.adsr["sustain"])
+        elif state == "release":
+            envelope = self.adsr["sustain"] * (1 - np.minimum(t / self.adsr["release"], 1.0))
+            if t[-1] >= self.adsr["release"]:
+                del self.notes[note_data["note"]]
+        note_data["time"] += samples / self.sample_rate
+        return envelope
+
+    def generate(self, samples):
+        try:
+            output = np.zeros(samples, dtype=np.float32)
+            for note, data in list(self.notes.items()):
+                data["note"] = note  # Note bilgisini sakla
+                freq = data["freq"]
+                phase = data["phase"]
+                amplitude = data["amplitude"]
+                envelope = self.apply_adsr(data, samples)
+
+                # LFO modülasyonu
+                lfo = np.sin(2 * np.pi * self.lfo["rate"] * np.arange(samples) / self.sample_rate + self.lfo_phase)
+                lfo_mod = 1 + self.lfo["depth"] * lfo
+                freq = freq * lfo_mod
+
+                # Wavetable sentezi
+                phase_inc = freq * self.wavetable_size / self.sample_rate
+                indices = np.arange(samples) * phase_inc + phase
+                indices = indices % self.wavetable_size
+                indices_int = indices.astype(int)
+                frac = indices - indices_int
+                wavetable_samples = self.wavetable[indices_int] * (1 - frac) + self.wavetable[(indices_int + 1) % self.wavetable_size] * frac
+                output += amplitude * envelope * wavetable_samples
+
+                data["phase"] = (phase + samples * phase_inc) % self.wavetable_size
+            self.lfo_phase += 2 * np.pi * self.lfo["rate"] * samples / self.sample_rate
+            return np.clip(output, -1.0, 1.0)
+        except Exception as e:
+            logging.error(f"Synth ses üretme hatası: {str(e)}")
+            return np.zeros(samples, dtype=np.float32)
+
+# musica_pro_omnibus/audio/midi.py
+class MidiController:
+    def __init__(self, synth):
+        self.synth = synth
+        self.midi_in = rtmidi.MidiIn()
+        self.midi_out = rtmidi.MidiOut()
+        self.param_mappings = {1: ("volume", 0.0, 1.0), 2: ("detune", -0.1, 0.1)}
+        self.init_midi()
+
+    def init_midi(self):
+        try:
+            if not self.midi_in.get_ports():
+                logging.warning("MIDI cihazı bulunamadı!")
+                return
+            self.midi_in.open_port(0)
+            self.midi_in.set_callback(self.midi_callback)
+            logging.info("MIDI cihazı bağlandı")
+        except Exception as e:
+            logging.error(f"MIDI bağlantı hatası: {str(e)}")
+            raise MidiError(f"MIDI bağlanamadı: {str(e)}")
+
+    def midi_callback(self, message, data):
+        try:
+            msg, _ = message
+            if msg[0] & 0xF0 == NOTE_ON:
+                note, velocity = msg[1], msg[2]
+                if velocity > 0:
+                    self.synth.note_on(note, velocity)
+                else:
+                    self.synth.note_off(note)
+            elif msg[0] & 0xF0 == NOTE_OFF:
+                note = msg[1]
+                self.synth.note_off(note)
+            elif msg[0] & 0xF0 == 0xB0:
+                cc_num, value = msg[1], msg[2]
+                if cc_num in self.param_mappings:
+                    param, min_val, max_val = self.param_mappings[cc_num]
+                    mapped_value = min_val + (value / 127) * (max_val - min_val)
+                    self.synth.set_param(param, mapped_value)
+                    logging.info(f"MIDI CC {cc_num}: {param} = {mapped_value}")
+        except Exception as e:
+            logging.error(f"MIDI callback hatası: {str(e)}")
+
+# musica_pro_omnibus/audio/tracks.py
+class AutomationLane:
+    def __init__(self):
+        self.points = []
+
+    def add_point(self, time_s, x, y):
+        self.points.append((time_s, x, y))
+        self.points.sort()
+
+    def get_value(self, time_s):
+        if not self.points:
+            return 0.0, 0.0
+        if len(self.points) == 1:
+            return self.points[0][1:]
+        for i, (t, x, y) in enumerate(self.points):
+            if t > time_s:
+                if i == 0:
+                    return x, y
+                t0, x0, y0 = self.points[i-1]
+                t1, x1, y1 = self.points[i]
+                frac = (time_s - t0) / (t1 - t0)
+                return x0 + frac * (x1 - x0), y0 + frac * (y1 - y0)
+        return self.points[-1][1:]
+
+class ProductionTrack:
+    def __init__(self, sample_rate=48000, channels=2, name="Track"):
+        self.sample_rate = sample_rate
+        self.channels = channels
+        self.name = name
+        self.clips = []
+        self.muted_clips = []
+        self.waveform_cache = None
+        self.automation = AutomationLane()
+        self.volume = 1.0
+        self.pan = 0.0
+        self.solo = False
+        self.mute = False
+        self.effects = EffectRack()
+        self.synth = WavetableOscillator(sample_rate)
+        self.midi_controller = MidiController(self.synth)
+        self.history = deque(maxlen=50)
+        self.waveform_thread = None
+
+    def add_clip(self, audio, start):
+        try:
+            if isinstance(audio, np.memmap) or audio.flags.writeable:
+                audio = audio.copy()
+            if audio.ndim == 1:
+                audio = np.repeat(audio[:, np.newaxis], 2, axis=1)
+            self.clips.append({"audio": audio, "start": start})
+            self.history.append(("add_clip", {"audio": audio, "start": start}))
+            self.update_waveform_async()
+        except Exception as e:
+            logging.error(f"Klip ekleme hatası: {str(e)}")
+            raise MusicaError(f"Klip eklenemedi: {str(e)}")
+
+    def split_clip(self, position):
+        try:
+            new_clips = []
+            for clip in self.clips:
+                clip_start = clip["start"]
+                clip_end = clip_start + len(clip["audio"]) / self.sample_rate
+                if clip_start < position < clip_end:
+                    split_idx = int((position - clip_start) * self.sample_rate)
+                    new_clips.append({"audio": clip["audio"][:split_idx], "start": clip_start})
+                    new_clips.append({"audio": clip["audio"][split_idx:], "start": position})
+                else:
+                    new_clips.append(clip)
+            self.history.append(("split_clip", {"clips": self.clips.copy(), "position": position}))
+            self.clips = new_clips
+            self.update_waveform_async()
+        except Exception as e:
+            logging.error(f"Klip bölme hatası: {str(e)}")
+            raise MusicaError(f"Klip bölünemedi: {str(e)}")
+
+    def undo(self):
+        if not self.history:
+            return False
+        try:
+            action, data = self.history.pop()
+            if action == "add_clip":
+                self.clips.pop()
+            elif action == "split_clip":
+                self.clips = data["clips"]
+            self.update_waveform_async()
+            return True
+        except Exception as e:
+            logging.error(f"Undo hatası: {str(e)}")
+            return False
+
+    def update_waveform_async(self):
+        if self.waveform_thread and self.waveform_thread.is_alive():
+            return  # Zaten bir hesaplama devam ediyor
+        self.waveform_thread = threading.Thread(target=self.update_waveform)
+        self.waveform_thread.daemon = True
+        self.waveform_thread.start()
+
+    def update_waveform(self):
+        try:
+            if not self.clips:
+                self.waveform_cache = None
+                return
+            audio = np.concatenate([clip["audio"] for clip in self.clips], axis=0)
+            if audio.ndim > 1:
+                audio = np.mean(audio, axis=1)
+            # FFT yerine RMS hesaplama
+            step = 512
+            waveform = []
+            for i in range(0, len(audio) - step, step):
+                chunk = audio[i:i+step]
+                rms = np.sqrt(np.mean(chunk**2))
+                waveform.append(rms)
+            self.waveform_cache = np.array(waveform) / np.max(waveform) if waveform else np.array([])
+        except Exception as e:
+            logging.error(f"Waveform güncelleme hatası: {str(e)}")
+            self.waveform_cache = None
+
+    def process(self, samples, position, channels=2):
+        try:
+            output = np.zeros((samples, channels), dtype=np.float32)
+            for clip in self.clips:
+                clip_start = int(clip["start"] * self.sample_rate)
+                clip_end = clip_start + len(clip["audio"])
+                if clip_start <= position < clip_end:
+                    out_start = max(0, clip_start - position)
+                    out_end = min(samples, clip_end - position)
+                    clip_slice = clip["audio"][out_start:out_end]
+                    if clip_slice.shape[1] < channels:
+                        clip_slice = np.repeat(clip_slice, channels // clip_slice.shape[1], axis=1)
+                    output[out_start:out_end] += clip_slice[:out_end-out_start] * self.volume
+            synth_audio = self.synth.generate(samples)
+            output += synth_audio[:, np.newaxis].repeat(channels, axis=1)
+            output[:, 0] *= max(0, 1 - self.pan)
+            output[:, 1] *= max(0, 1 + self.pan)
+            output = self.effects.process(output, self.sample_rate)
+            return np.clip(output, -1.0, 1.0)
+        except Exception as e:
+            logging.error(f"Track işleme hatası: {str(e)}")
+            return np.zeros((samples, channels), dtype=np.float32)
+
+# musica_pro_omnibus/audio/player.py
+class MusicPlayer:
+    def __init__(self, config, audio_chain):
+        self.config = config
+        self.audio_chain = audio_chain
+        self.fs = config.get("sample_rate", 48000)
+        self.buffer_size = config.get("buffer_size", 128)
+        self.stream = None
+        self.position = 0
+        self.is_playing = False
+        self._lock = threading.Lock()
+        self.init_audio()
+
+    def init_audio(self):
+        try:
+            if self.stream:
+                self.stream.close()
+            self.stream = sd.Stream(
+                samplerate=self.fs,
+                blocksize=self.buffer_size,
+                channels=2,
+                callback=self._callback,
+                latency="low"
+            )
+            logging.info(f"Ses akışı başlatıldı: buffer={self.buffer_size}")
+        except Exception as e:
+            logging.error(f"Ses akışı başlatılamadı: {str(e)}")
+            self.buffer_size *= 2
+            if self.buffer_size <= 4096:
+                self.init_audio()
+            else:
+                raise MusicaError("Ses cihazı başlatılamadı!")
+
+    def play(self):
+        with self._lock:
+            if not self.is_playing:
+                self.is_playing = True
+                self.stream.start()
+                logging.info("Oynatma başlatıldı")
+
+    def pause(self):
+        with self._lock:
+            if self.is_playing:
+                self.is_playing = False
+                self.stream.stop()
+                logging.info("Oynatma duraklatıldı")
+
+    def stop(self):
+        with self._lock:
+            self.is_playing = False
+            self.position = 0
+            self.stream.stop()
+            logging.info("Oynatma durduruldu")
+
+    def seek(self, time_in_seconds):
+        with self._lock:
+            self.position = int(time_in_seconds * self.fs)
+            logging.info(f"Pozisyon ayarlandı: {time_in_seconds}s")
+
+    def _callback(self, outdata, frames, time_info, status):
+        if status:
+            logging.warning(f"Ses akışı durumu: {status}")
+        with self._lock:
+            if not self.is_playing:
+                outdata.fill(0)
+                return
+            try:
+                outdata[:] = self.audio_chain.render_master(frames, self.position)
+                self.position += frames
+            except Exception as e:
+                logging.error(f"Ses render hatası: {str(e)}")
+                outdata.fill(0)
+
+# musica_pro_omnibus/audio/chain.py
+class AudioChain:
+    def __init__(self):
+        self.config = ConfigManager()
+        self.fs = self.config.get("sample_rate", 48000)
+        self.production_tracks = []
+        self.player = MusicPlayer(self.config, self)
+        self.master_effects = EffectRack()
+        self.dac_simulator = DACAmpSimulator(self.fs)
+        self.project_manager = ProjectManager(self)
+        self.solo_active = False
+
+    def add_track(self, name="Track"):
+        track = ProductionTrack(sample_rate=self.fs, name=name)
+        self.production_tracks.append(track)
+        return track
+
+    def render_master(self, samples, position, channels=2):
+        try:
+            output = np.zeros((samples, channels), dtype=np.float32)
+            any_solo = any(track.solo for track in self.production_tracks)
+            self.solo_active = any_solo
+
+            for track in self.production_tracks:
+                if self.solo_active and not track.solo:
+                    continue
+                if track.mute:
+                    continue
+                output += track.process(samples, position, channels)
+
+            output = self.master_effects.process(output, self.fs)
+            output = self.dac_simulator.process(output)
+            return output
+        except Exception as e:
+            logging.error(f"Master render hatası: {str(e)}")
+            return np.zeros((samples, channels), dtype=np.float32)
+
+# musica_pro_omnibus/ai/segmentation.py
+class AudioSegmentation:
+    def __init__(self):
+        self.separator = Separator.from_hparams(source="speechbrain/sepformer-wham", savedir="pretrained_models/") if Separator else None
+
+    def segment(self, audio, sample_rate):
+        try:
+            if not self.separator:
+                return {"speech": audio, "music": np.zeros_like(audio), "noise": np.zeros_like(audio)}
+            audio_tensor = torch.tensor(audio.T, dtype=torch.float32)
+            separated = self.separator.separate_batch(audio_tensor).numpy()
+            return {
+                "speech": separated[0].T,
+                "music": separated[1].T if separated.shape[0] > 1 else np.zeros_like(audio),
+                "noise": separated[2].T if separated.shape[0] > 2 else np.zeros_like(audio)
+            }
+        except Exception as e:
+            logging.error(f"Ses segmentasyon hatası: {str(e)}")
+            return {"speech": audio, "music": np.zeros_like(audio), "noise": np.zeros_like(audio)}
+
+# musica_pro_omnibus/ai/stylization.py
+class AudioStylization:
+    @staticmethod
+    def apply_style(audio, style="rock"):
+        try:
+            # Stil bazlı efekt parametre değişiklikleri (mock implementasyon)
+            if style == "rock":
+                reverb = Reverb(room_size=0.8, damping=0.2)
+                processed = reverb.process(audio, sample_rate=48000)
+                comp = Compressor(threshold_db=-30, ratio=6)
+                processed = comp.process(processed, sample_rate=48000)
+            elif style == "jazz":
+                reverb = Reverb(room_size=0.5, damping=0.5)
+                processed = reverb.process(audio, sample_rate=48000)
+                chorus = Chorus()
+                processed = chorus.process(processed, sample_rate=48000)
+            elif style == "klasik":
+                reverb = Reverb(room_size=0.9, damping=0.1)
+                processed = reverb.process(audio, sample_rate=48000)
+            else:
+                processed = audio
+            return processed
+        except Exception as e:
+            logging.error(f"Stil aktarım hatası: {str(e)}")
+            return audio
+
+# musica_pro_omnibus/ai/transcription.py
+class AudioTranscription:
+    def __init__(self):
+        self.model = whisper.load_model("base") if whisper else None
+
+    def transcribe(self, audio, sample_rate):
+        try:
+            if not self.model:
+                return "Whisper modeli yüklü değil (mock transkripsiyon)!"
+            audio_path = "temp_transcribe.wav"
+            sf.write(audio_path, audio, sample_rate)
+            result = self.model.transcribe(audio_path)
+            os.remove(audio_path)
+            return result["text"]
+        except Exception as e:
+            logging.error(f"Transkripsiyon hatası: {str(e)}")
+            return "Transkripsiyon başarısız!"
+
+# musica_pro_omnibus/video/processor.py
+class VideoProcessor:
+    def __init__(self, sample_rate=48000):
+        self.sample_rate = sample_rate
+        self.video_path = None
+        self.video_stream = None
+        self.audio_stream = None
+        self.video_fps = 0
+        self.video_duration = 0
+        self.frame_cache = TTLCache(maxsize=200, ttl=300)
+        self.use_low_res = True  # Düşük çözünürlüklü önizleme
+
+    def adjust_cache_size(self):
+        try:
+            mem = psutil.virtual_memory()
+            available = mem.available / (1024 * 1024)
+            if available < 1000:
+                self.frame_cache.maxsize = max(50, self.frame_cache.maxsize // 2)
+            elif available > 4000:
+                self.frame_cache.maxsize = min(500, self.frame_cache.maxsize * 2)
+            logging.info(f"Önbellek boyutu güncellendi: {self.frame_cache.maxsize}")
+        except Exception as e:
+            logging.error(f"Önbellek boyutu güncelleme hatası: {str(e)}")
+
+    def load_video(self, file_path, audio_chain):
+        try:
+            probe = ffmpeg.probe(file_path)
+            video_stream = next((s for s in probe['streams'] if s['codec_type'] == 'video'), None)
+            if not video_stream:
+                raise ValueError("Geçerli video akışı bulunamadı")
+            self.video_path = file_path
+            self.video_stream = ffmpeg.input(file_path).video
+            self.audio_stream = ffmpeg.input(file_path).audio if any(s['codec_type'] == 'audio' for s in probe['streams']) else None
+            self.video_fps = float(video_stream['r_frame_rate'].split('/')[0]) / float(video_stream['r_frame_rate'].split('/')[1])
+            self.video_duration = float(probe['format']['duration'])
+
+            if self.audio_stream:
+                audio_path = "temp_audio.wav"
+                try:
+                    ffmpeg.output(self.audio_stream, audio_path, acodec='pcm_s16le', ar=self.sample_rate, ac=2).run(overwrite_output=True)
+                    with sf.SoundFile(audio_path) as f:
+                        audio_data = np.memmap(audio_path, dtype='float32', mode='r', shape=(f.frames, 2))
+                    if audio_data.ndim == 1:
+                        audio_data = np.repeat(audio_data[:, np.newaxis], 2, axis=1)
+                    track = audio_chain.add_track("Video Sesi")
+                    track.add_clip(audio_data, 0.0)
+                finally:
+                    if os.path.exists(audio_path):
+                        os.remove(audio_path)
+            logging.info(f"Video yüklendi: {file_path}")
+            return self.video_duration, self.video_fps
+        except Exception as e:
+            logging.error(f"Video yükleme hatası: {str(e)}")
+            raise MusicaError(f"Video yüklenemedi: {str(e)}")
+
+    def get_frame(self, position):
+        frame_number = int(position * self.video_fps)
+        if frame_number in self.frame_cache:
+            return self.frame_cache[frame_number]
+        try:
+            frame_data = self._fetch_frame(position)
+            probe = ffmpeg.probe(self.video_path)
+            width = 640 if self.use_low_res else 1280  # Düşük çözünürlüklü önizleme
+            height = int(float(probe['streams'][0]['height']) * width / float(probe['streams'][0]['width']))
+            frame = np.frombuffer(frame_data, dtype=np.uint8).reshape((height, width, 3))
+            self.frame_cache[frame_number] = frame
+            self.adjust_cache_size()
+            return frame
+        except Exception as e:
+            logging.error(f"Kare çekme hatası: {str(e)}")
+            raise MusicaError(f"Kare alınamadı: {str(e)}")
+
+    def _fetch_frame(self, position):
+        try:
+            width = 640 if self.use_low_res else 1280
+            return ffmpeg.input(
+                self.video_path, ss=position
+            ).filter('scale', width, -1).output(
+                'pipe:', format='rawvideo', pix_fmt='rgb24', vframes=1
+            ).run(capture_stdout=True)[0]
+        except Exception as e:
+            logging.error(f"Kare alma hatası: {str(e)}")
+            raise MusicaError(f"Kare alınamadı: {str(e)}")
+
+    def apply_color_correction(self, video_stream, brightness=0, contrast=1):
+        try:
+            return video_stream.filter('eq', brightness=brightness, contrast=contrast)
+        except Exception as e:
+            logging.error(f"Renk düzeltme hatası: {str(e)}")
+            return video_stream
+
+# musica_pro_omnibus/video/text_overlay.py
+class TextOverlayManager:
+    def __init__(self):
+        self.overlays = []
+        self.font_files = {
+            "Open Sans": "fonts/OpenSans-Regular.ttf",
+            "Roboto": "fonts/Roboto-Regular.ttf",
+            "Arial": "fonts/Arial.ttf"
+        }
+
+    def add_overlay(self, text, font_name, color, x_pos, y_pos, start_time, duration):
+        try:
+            font_path = self.font_files.get(font_name, "fonts/OpenSans-Regular.ttf")
+            self.overlays.append({
+                "text": text,
+                "font_path": font_path,
+                "color": color,
+                "x_pos": x_pos,
+                "y_pos": y_pos,
+                "start_time": start_time,
+                "duration": duration
+            })
+        except Exception as e:
+            logging.error(f"Metin katmanı ekleme hatası: {str(e)}")
+
+    def apply_overlays(self, video_stream):
+        try:
+            for overlay in self.overlays:
+                video_stream = video_stream.drawtext(
+                    text=overlay["text"],
+                    fontfile=overlay["font_path"],
+                    fontsize=24,
+                    fontcolor=overlay["color"],
+                    x=f"(w-text_w)*{overlay['x_pos']}",
+                    y=f"(h-text_h)*{overlay['y_pos']}",
+                    enable=f"between(t,{overlay['start_time']},{overlay['start_time']+overlay['duration']})"
+                )
+            return video_stream
+        except Exception as e:
+            logging.error(f"Metin katmanı uygulama hatası: {str(e)}")
+            return video_stream
+
+# musica_pro_omnibus/integrations/google.py
+class GoogleIntegration:
+    def __init__(self):
+        self.credentials = None
+
+    def login(self):
+        try:
+            from google.oauth2.credentials import Credentials
+            from google_auth_oauthlib.flow import InstalledAppFlow
+            from googleapiclient.discovery import build
+            from googleapiclient.http import MediaFileUpload
+        except ImportError:
+            raise MusicaError("Google API modülleri eksik!")
+        try:
+            flow = InstalledAppFlow.from_client_secrets_file(
+                'client_secrets.json',
+                scopes=['https://www.googleapis.com/auth/youtube.upload', 'https://www.googleapis.com/auth/drive.file']
+            )
+            self.credentials = flow.run_local_server(port=0)
+            logging.info("Google ile giriş başarılı")
+        except Exception as e:
+            logging.error(f"Google giriş hatası: {str(e)}")
+            raise MusicaError(f"Google girişi başarısız: {str(e)}")
+
+    def upload_to_youtube(self, file_path):
+        if not self.credentials:
+            raise MusicaError("Google ile giriş yapın!")
+        try:
+            from googleapiclient.discovery import build
+            from googleapiclient.http import MediaFileUpload
+            youtube = build('youtube', 'v3', credentials=self.credentials)
+            body = {
+                'snippet': {
+                    'title': os.path.basename(file_path),
+                    'description': 'MusicaProOmnibus ile oluşturuldu',
+                    'tags': ['video', 'musica'],
+                    'categoryId': '22'
+                },
+                'status': {
+                    'privacyStatus': 'private'
+                }
+            }
+            media = MediaFileUpload(file_path)
+            youtube.videos().insert(
+                part='snippet,status',
+                body=body,
+                media_body=media
+            ).execute()
+            logging.info(f"Video YouTube'a yüklendi: {file_path}")
+        except Exception as e:
+            logging.error(f"YouTube yükleme hatası: {str(e)}")
+            raise MusicaError(f"YouTube yüklemesi başarısız: {str(e)}")
+
+    def save_to_drive(self, file_path):
+        if not self.credentials:
+            raise MusicaError("Google ile giriş yapın!")
+        try:
+            from googleapiclient.discovery import build
+            from googleapiclient.http import MediaFileUpload
+            drive = build('drive', 'v3', credentials=self.credentials)
+            file_metadata = {
+                'name': os.path.basename(file_path),
+                'mimeType': 'video/mp4'
+            }
+            media = MediaFileUpload(file_path)
+            drive.files().create(
+                body=file_metadata,
+                media_body=media,
+                fields='id'
+            ).execute()
+            logging.info(f"Video Drive'a kaydedildi: {file_path}")
+        except Exception as e:
+            logging.error(f"Drive kaydetme hatası: {str(e)}")
+            raise MusicaError(f"Drive kaydetme başarısız: {str(e)}")
+
+# musica_pro_omnibus/webassembly/core.py
+class WebAssemblyCore:
+    @staticmethod
+    def process_audio(audio, sample_rate, effect="reverb"):
+        try:
+            # Pyodide ile tarayıcıda çalışacak basit bir ses işleme motoru
+            from pedalboard import Reverb
+            reverb = Reverb()
+            return reverb.process(audio, sample_rate=sample_rate)
+        except Exception as e:
+            logging.error(f"WebAssembly ses işleme hatası: {str(e)}")
+            return audio
+
+# musica_pro_omnibus/server.py
+app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
+
+# WebSocket sunucusu
+ws_clients = []
+
+def on_ws_message(ws, message):
+    try:
+        data = json.loads(message)
+        for client in ws_clients:
+            client.send(json.dumps(data))
+    except Exception as e:
+        logging.error(f"WebSocket mesaj işleme hatası: {str(e)}")
+
+def start_ws_server():
+    ws_server = websocket.WebSocketApp(
+        "ws://localhost:8765",
+        on_message=on_ws_message
+    )
+    ws_server.run_forever()
+
+# Transkripsiyon modeli
+transcription_model = whisper.load_model("base") if whisper else None
+
+@app.route("/transcribe", methods=["POST"])
+def transcribe_audio():
+    try:
+        audio_data = np.array(request.json["audio"], dtype=np.float32)
+        sample_rate = request.json["sample_rate"]
+        audio_path = "temp_transcribe.wav"
+        sf.write(audio_path, audio_data, sample_rate)
+        result = transcription_model.transcribe(audio_path)
+        os.remove(audio_path)
+        return jsonify({"transcription": result["text"]})
+    except Exception as e:
+        logging.error(f"Sunucu transkripsiyon hatası: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/process_effect", methods=["POST"])
+def process_effect():
+    try:
+        audio_data = np.array(request.json["audio"], dtype=np.float32)
+        effect_type = request.json["effect_type"]
+        sample_rate = request.json["sample_rate"]
+        from pedalboard import Reverb, Compressor
+        effect = Reverb() if effect_type == "reverb" else Compressor()
+        processed = effect.process(audio_data, sample_rate=sample_rate)
+        return jsonify({"audio": processed.tolist()})
+    except Exception as e:
+        logging.error(f"Sunucu efekt işleme hatası: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+def start_server():
+    threading.Thread(target=start_ws_server, daemon=True).start()
+    app.run(host="0.0.0.0", port=8000, use_reloader=False)
+
+# musica_pro_omnibus/gui/video_ui.py
+class VideoSyncPostProd:
+    def __init__(self, parent_gui, audio_chain):
+        self.parent_gui = parent_gui
+        self.audio_chain = audio_chain
+        self.sample_rate = audio_chain.fs
+        self.video_processor = VideoProcessor(self.sample_rate)
+        self.text_overlay_manager = TextOverlayManager()
+        self.google_integration = GoogleIntegration()
+        self.current_position = 0
+        self.is_playing = False
+        self.markers = []
+        self.split_points = []
+        self.executor = ThreadPoolExecutor(max_workers=4)
+        self.lock = threading.Lock()
+        self.sync_timer = QTimer()
+        self.sync_timer.timeout.connect(self.check_av_sync)
+        self.audio_track_idx = None
+        self.adr_cue_timer = QTimer()
+        self.adr_cue_timer.timeout.connect(self.update_adr_cue)
+        self.ai_cleaner = Separator.from_hparams(source="speechbrain/sepformer-wham", savedir="pretrained_models/") if Separator else None
+        self.adr_recordings = []
+        self.segmentation = AudioSegmentation()
+        self.stylization = AudioStylization()
+        self.transcription = AudioTranscription()
+        self.marketplace = AssetMarketplace()
+        self.food_mode_message_scene = QGraphicsScene()
+        self.food_mode_message_view = QGraphicsView()
+        self.init_ui()
+
+    def init_ui(self):
+        self.tab_widget = QWidget()
+        self.tab_layout = QVBoxLayout(self.tab_widget)
+        self.parent_gui.tabs.addTab(self.tab_widget, "Video Post Prodüksiyon")
+
+        # Yemek modu mesaj alanı
+        self.food_mode_message_view.setScene(self.food_mode_message_scene)
+        self.food_mode_message_view.setFixedHeight(50)
+        self.tab_layout.addWidget(self.food_mode_message_view)
+
+        # Tema ve yemek modu uygulaması
+        self.apply_theme_and_food_mode()
+
+        # Video Görünüm
+        self.video_view = QGraphicsView()
+        self.video_scene = QGraphicsScene()
+        self.video_view.setScene(self.video_scene)
+        self.tab_layout.addWidget(self.video_view)
+
+        # ADR Cue Görseli
+        self.adr_cue_view = QGraphicsView()
+        self.adr_cue_scene = QGraphicsScene()
+        self.adr_cue_view.setScene(self.adr_cue_scene)
+        self.adr_cue_view.setFixedSize(50, 50)
+        self.tab_layout.addWidget(self.adr_cue_view)
+
+        # Kontroller
+        controls_layout = QHBoxLayout()
+        self.import_btn = QPushButton("Video İçe Aktar")
+        self.import_btn.clicked.connect(self.import_video)
+        self.play_btn = QPushButton("Oynat")
+        self.play_btn.clicked.connect(self.play_video)
+        self.pause_btn = QPushButton("Duraklat")
+        self.pause_btn.clicked.connect(self.pause_video)
+        self.stop_btn = QPushButton("Durdur")
+        self.stop_btn.clicked.connect(self.stop_video)
+        self.add_marker_btn = QPushButton("İşaretleyici Ekle")
+        self.add_marker_btn.clicked.connect(self.add_marker)
+        self.export_btn = QPushButton("Videoyu Export Et")
+        self.export_btn.clicked.connect(self.export_video)
+        self.split_btn = QPushButton("Klip Böl")
+        self.split_btn.clicked.connect(self.split_clip)
+        self.food_mode_combo = QComboBox()
+        self.food_mode_combo.addItems(["Yemek Modu Yok", "Sucuk Ekmek Modu 🍖", "Döner Modu 🥙", "Lahmacun Modu 🥨"])
+        self.food_mode_combo.currentTextChanged.connect(self.change_food_mode)
+        self.undo_btn = QPushButton("Geri Al (Ctrl+Z)")
+        self.undo_btn.clicked.connect(self.undo_action)
+        controls_layout.addWidget(self.import_btn)
+        controls_layout.addWidget(self.play_btn)
+        controls_layout.addWidget(self.pause_btn)
+        controls_layout.addWidget(self.stop_btn)
+        controls_layout.addWidget(self.add_marker_btn)
+        controls_layout.addWidget(self.export_btn)
+        controls_layout.addWidget(self.split_btn)
+        controls_layout.addWidget(self.food_mode_combo)
+        controls_layout.addWidget(self.undo_btn)
+        self.tab_layout.addLayout(controls_layout)
+
+        # Kısayollar
+        shortcuts = self.audio_chain.config.get("shortcuts")
+        self.play_btn.setShortcut(shortcuts["play"])
+        self.stop_btn.setShortcut(shortcuts["stop"])
+        self.export_btn.setShortcut(shortcuts["export"])
+        self.undo_btn.setShortcut("Ctrl+Z")
+
+        # Proje İşbirliği
+        collab_layout = QHBoxLayout()
+        self.export_project_btn = QPushButton("Projeyi Export Et")
+        self.export_project_btn.clicked.connect(self.export_project)
+        self.import_project_btn = QPushButton("Projeyi Import Et")
+        self.import_project_btn.clicked.connect(self.import_project)
+        collab_layout.addWidget(self.export_project_btn)
+        collab_layout.addWidget(self.import_project_btn)
+        self.tab_layout.addLayout(collab_layout)
+
+        # Eklenti Yükleme ve Marketplace
+        plugin_layout = QHBoxLayout()
+        self.load_plugin_btn = QPushButton("Eklenti Yükle")
+        self.load_plugin_btn.clicked.connect(self.load_plugin)
+        self.plugin_combo = QComboBox()
+        self.plugin_combo.addItem("Eklenti Seç")
+        self.marketplace_btn = QPushButton("Marketplace'ten Eklenti İndir")
+        self.marketplace_btn.clicked.connect(self.browse_marketplace)
+        plugin_layout.addWidget(self.load_plugin_btn)
+        plugin_layout.addWidget(self.plugin_combo)
+        plugin_layout.addWidget(self.marketplace_btn)
+        self.tab_layout.addLayout(plugin_layout)
+
+        # ADR Track Seçimi
+        self.adr_track_layout = QHBoxLayout()
+        self.adr_track_combo = QComboBox()
+        self.adr_track_combo.addItem("Yeni Track")
+        for track in self.audio_chain.production_tracks:
+            self.adr_track_combo.addItem(track.name)
+        self.adr_track_combo.currentIndexChanged.connect(self.update_adr_track)
+        self.adr_track_layout.addWidget(QLabel("ADR Track:"))
+        self.adr_track_layout.addWidget(self.adr_track_combo)
+        self.tab_layout.addLayout(self.adr_track_layout)
+
+        # Voiceover Modu
+        self.voiceover_layout = QHBoxLayout()
+        self.voiceover_btn = QPushButton("Voiceover Kaydet")
+        self.voiceover_btn.clicked.connect(self.start_voiceover_recording)
+        self.voiceover_text = QTextEdit()
+        self.voiceover_text.setPlaceholderText("Voiceover metnini buraya yaz...")
+        self.voiceover_layout.addWidget(self.voiceover_btn)
+        self.voiceover_layout.addWidget(self.voiceover_text)
+        self.tab_layout.addLayout(self.voiceover_layout)
+
+        # Ducking Kontrolü
+        self.ducking_layout = QHBoxLayout()
+        self.ducking_btn = QPushButton("Audio Ducking Uygula")
+        self.ducking_btn.clicked.connect(self.apply_ducking)
+        self.ducking_threshold = QSlider(Qt.Horizontal)
+        self.ducking_threshold.setRange(-60, 0)
+        self.ducking_threshold.setValue(-20)
+        self.ducking_track_combo = QComboBox()
+        self.ducking_track_combo.addItem("Müzik Track Seç")
+        for track in self.audio_chain.production_tracks:
+            self.ducking_track_combo.addItem(track.name)
+        self.ducking_layout.addWidget(self.ducking_btn)
+        self.ducking_layout.addWidget(QLabel("Ducking Eşiği (dB):"))
+        self.ducking_layout.addWidget(self.ducking_threshold)
+        self.ducking_layout.addWidget(QLabel("Müzik Track:"))
+        self.ducking_layout.addWidget(self.ducking_track_combo)
+        self.tab_layout.addLayout(self.ducking_layout)
+
+        # Başlık/Yazı Ekleme
+        self.text_layout = QHBoxLayout()
+        self.text_input = QLineEdit()
+        self.text_input.setPlaceholderText("Videonun üzerine eklenecek metni girin...")
+        self.font_combo = QComboBox()
+        self.font_combo.addItems(self.text_overlay_manager.font_files.keys())
+        self.color_btn = QPushButton("Renk Seç")
+        self.color_btn.clicked.connect(self.choose_text_color)
+        self.text_pos_x = QSlider(Qt.Horizontal)
+        self.text_pos_x.setRange(0, 100)
+        self.text_pos_x.setValue(50)
+        self.text_pos_y = QSlider(Qt.Horizontal)
+        self.text_pos_y.setRange(0, 100)
+        self.text_pos_y.setValue(50)
+        self.add_text_btn = QPushButton("Metin Ekle")
+        self.add_text_btn.clicked.connect(self.add_text_overlay)
+        self.text_layout.addWidget(self.text_input)
+        self.text_layout.addWidget(self.font_combo)
+        self.text_layout.addWidget(self.color_btn)
+        self.text_layout.addWidget(QLabel("X Poz:"))
+        self.text_layout.addWidget(self.text_pos_x)
+        self.text_layout.addWidget(QLabel("Y Poz:"))
+        self.text_layout.addWidget(self.text_pos_y)
+        self.text_layout.addWidget(self.add_text_btn)
+        self.tab_layout.addLayout(self.text_layout)
+
+        # Renk Düzeltme
+        color_correction_layout = QHBoxLayout()
+        self.brightness_slider = QSlider(Qt.Horizontal)
+        self.brightness_slider.setRange(-100, 100)
+        self.brightness_slider.setValue(0)
+        self.contrast_slider = QSlider(Qt.Horizontal)
+        self.contrast_slider.setRange(0, 200)
+        self.contrast_slider.setValue(100)
+        self.apply_color_btn = QPushButton("Renk Düzeltme Uygula")
+        self.apply_color_btn.clicked.connect(self.apply_color_correction)
+        color_correction_layout.addWidget(QLabel("Parlaklık:"))
+        color_correction_layout.addWidget(self.brightness_slider)
+        color_correction_layout.addWidget(QLabel("Kontrast:"))
+        color_correction_layout.addWidget(self.contrast_slider)
+        color_correction_layout.addWidget(self.apply_color_btn)
+        self.tab_layout.addLayout(color_correction_layout)
+
+        # AI Özellikleri
+        ai_layout = QHBoxLayout()
+        self.segment_btn = QPushButton("Ses Segmentasyonu Yap")
+        self.segment_btn.clicked.connect(self.segment_audio)
+        self.style_combo = QComboBox()
+        self.style_combo.addItems(["Stil Seç", "Rock", "Jazz", "Klasik"])
+        self.apply_style_btn = QPushButton("Stil Aktarımı Uygula")
+        self.apply_style_btn.clicked.connect(self.apply_style)
+        self.transcribe_btn = QPushButton("Sesi Transkribe Et")
+        self.transcribe_btn.clicked.connect(self.transcribe_audio)
+        self.transcription_output = QTextEdit()
+        self.transcription_output.setReadOnly(True)
+        ai_layout.addWidget(self.segment_btn)
+        ai_layout.addWidget(self.style_combo)
+        ai_layout.addWidget(self.apply_style_btn)
+        ai_layout.addWidget(self.transcribe_btn)
+        ai_layout.addWidget(self.transcription_output)
+        self.tab_layout.addLayout(ai_layout)
+
+        # Google Entegrasyonu
+        self.google_layout = QHBoxLayout()
+        self.google_login_btn = QPushButton("Google ile Giriş")
+        self.google_login_btn.clicked.connect(self.google_login)
+        self.google_retry_btn = QPushButton("Google Girişi Yeniden Dene")
+        self.google_retry_btn.clicked.connect(self.google_login)
+        self.google_retry_btn.setEnabled(False)
+        self.upload_youtube_btn = QPushButton("YouTube'a Yükle")
+        self.upload_youtube_btn.clicked.connect(self.upload_to_youtube)
+        self.upload_youtube_btn.setEnabled(False)
+        self.save_drive_btn = QPushButton("Drive'a Kaydet")
+        self.save_drive_btn.clicked.connect(self.save_to_drive)
+        self.save_drive_btn.setEnabled(False)
+        self.google_layout.addWidget(self.google_login_btn)
+        self.google_layout.addWidget(self.google_retry_btn)
+        self.google_layout.addWidget(self.upload_youtube_btn)
+        self.google_layout.addWidget(self.save_drive_btn)
+        self.tab_layout.addLayout(self.google_layout)
+
+        # Zaman Çizelgesi
+        self.timeline_view = pg.PlotWidget()
+        self.timeline_view.setBackground('w')
+        self.tab_layout.addWidget(self.timeline_view)
+
+        # İşaretleyici Listesi
+        self.marker_label = QLabel("İşaretleyiciler:")
+        self.tab_layout.addWidget(self.marker_label)
+        self.marker_list = QLabel("Henüz işaretleyici yok")
+        self.tab_layout.addLayout(self.tab_layout)
+
+        # Ses Post Prodüksiyon Araçları
+        postprod_layout = QHBoxLayout()
+        self.clean_dialog_btn = QPushButton("Diyalog Temizle (Wiener)")
+        self.clean_dialog_btn.clicked.connect(lambda: self.clean_dialog(use_ai=False))
+        self.clean_ai_btn = QPushButton("Diyalog Temizle (AI)")
+        self.clean_ai_btn.clicked.connect(lambda: self.clean_dialog(use_ai=True))
+        self.clean_ai_btn.setEnabled(bool(self.ai_cleaner))
+        self.undo_clean_btn = QPushButton("Temizlemeyi Geri Al")
+        self.undo_clean_btn.clicked.connect(self.undo_clean)
+        self.adr_record_btn = QPushButton("ADR Kaydı Başlat")
+        self.adr_record_btn.clicked.connect(self.start_adr_recording)
+        postprod_layout.addWidget(self.clean_dialog_btn)
+        postprod_layout.addWidget(self.clean_ai_btn)
+        postprod_layout.addWidget(self.undo_clean_btn)
+        postprod_layout.addWidget(self.adr_record_btn)
+        self.tab_layout.addLayout(postprod_layout)
+
+        # Pozisyon Slider'ı
+        self.position_slider = QSlider(Qt.Horizontal)
+        self.position_slider.setMinimum(0)
+        self.position_slider.setMaximum(1000)
+        self.position_slider.sliderMoved.connect(self.seek_video)
+        self.tab_layout.addWidget(self.position_slider)
+
+        # Zaman Göstergesi
+        self.time_label = QLabel("0:00 / 0:00")
+        self.tab_layout.addWidget(self.time_label)
+
+        # İlerleme Çubuğu
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        self.tab_layout.addWidget(self.progress_bar)
+
+        # Oynatma Zamanlayıcı
+        self.playback_timer = QTimer()
+        self.playback_timer.timeout.connect(self.update_playback)
+
+    def apply_theme_and_food_mode(self):
+        try:
+            food_mode = self.audio_chain.config.get("food_mode", "none")
+            colors = self.audio_chain.config.get("custom_colors")
+            self.food_mode_message_scene.clear()
+            if food_mode == "sucuk_ekmek":
+                self.tab_widget.setStyleSheet("background-color: #FF4500; color: #FFF8DC;")
+                self.show_food_mode_animation("Sucuk Ekmek Modu aktif! Mangal kokusu geliyor... 🍖🍖🍖")
+            elif food_mode == "doner":
+                self.tab_widget.setStyleSheet("background-color: #A52A2A; color: #FFFFFF;")
+                self.show_food_mode_animation("D
